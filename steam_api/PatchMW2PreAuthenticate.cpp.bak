@@ -1,0 +1,283 @@
+// ==========================================================
+// IW4M project
+// 
+// Component: clientdll
+// Sub-component: steam_api
+// Purpose: Patches to perform NP authentication at challenge
+//          time.
+//
+// Initial author: NTAuthority
+// Started: 2012-12-26
+// ==========================================================
+
+#include "StdInc.h"
+#include "Hooking.h"
+#include "PatchMW2PreAuthenticate.h"
+
+typedef struct
+{
+	netadr_t adr;
+	int challenge;
+	int time1;
+	int pingTime;
+	int time2;
+	int pad;
+	int pad2;
+	char guid[20];
+} challengeState_t;
+
+challengeState_t* challengeStates = (challengeState_t*)0x62B68D4;
+extern int* svs_time;
+
+typedef void (__cdecl * SV_SendSteamAuthorize_t)(netadr_t adr, NPID id);
+SV_SendSteamAuthorize_t SV_SendSteamAuthorize = (SV_SendSteamAuthorize_t)0x437CE0;
+
+void SV_SendAuthorize(const char* guidString, challengeState_t* state)
+{
+	strcpy_s(state->guid, sizeof(state->guid), guidString);
+
+	NPID serverID;
+	NP_GetNPID(&serverID);
+	SV_SendSteamAuthorize(state->adr, serverID);
+	//NET_OutOfBandPrint(NS_SERVER, state->adr, "steamauthReq");	
+}
+
+void HandleSteamAuthResult(NPAsync<NPValidateUserTicketResult>* async)
+{
+	NPValidateUserTicketResult* result = async->GetResult();
+	challengeState_t* state = (challengeState_t*)async->GetUserData();
+
+	NPID guid = _strtoi64(state->guid, NULL, 16);
+
+	if (result->id != guid)
+	{
+		NET_OutOfBandPrint(NS_SERVER, state->adr, "error\n%s", "Auth ticket result NPID does not match challenge NPID.");
+
+		memset(state, 0, sizeof(*state));
+		return;
+	}
+
+	if (result->result == ValidateUserTicketResultOK)
+	{
+		state->pingTime = *svs_time;
+		NET_OutOfBandPrint(NS_SERVER, state->adr, "challengeResponse %i", state->challenge);
+	}
+	else
+	{
+		NET_OutOfBandPrint(NS_SERVER, state->adr, "error\n%s", "Ticket verification failed. Redownload the client from http://repziw4.de/ and try again.");
+
+		memset(state, 0, sizeof(*state));
+	}
+}
+
+typedef bool (__cdecl * NET_IsLanAddress_t)(netadr_t adr);
+NET_IsLanAddress_t NET_IsLanAddress = (NET_IsLanAddress_t)0x43D6C0;
+
+CallHook processSteamAuthHook;
+DWORD processSteamAuthHookLoc = 0x6266B5;
+
+void ProcessSteamAuthHookFunc(netadr_t adr, msg_t* msg)
+{
+	char ticketData[2048];
+	int i;
+	challengeState_t* state;
+
+	for (i = 0; i < 1024; i++)
+	{
+		if (NET_CompareAdr(challengeStates[i].adr, adr))
+		{
+			state = &challengeStates[i];
+			break;
+		}
+	}
+
+	if (i == 1024)
+	{
+		NET_OutOfBandPrint(NS_SERVER, adr, "error\n%s", "Unknown IP for challenge.");
+		return;
+	}
+	
+	NPID guid = _strtoi64(state->guid, NULL, 16);
+	NPID npID = MSG_ReadInt64(msg);
+
+	if (npID != guid)
+	{
+		memset(state, 0, sizeof(*state));
+
+		NET_OutOfBandPrint(NS_SERVER, adr, "error\n%s", "Auth ticket NPID does not match challenge NPID.");
+		return;
+	}
+
+	short ticketLength = MSG_ReadShort(msg);
+	MSG_ReadData(msg, ticketData, ticketLength); // muahaha
+
+	//Com_Printf(0, "msg: %s", msg);
+	//Com_Printf(0, "ticketData: %s", ticketData);
+
+	DWORD clientIP = (adr.ip[0] << 24) | (adr.ip[1] << 16) | (adr.ip[2] << 8) | adr.ip[3];
+
+	if (NET_IsLanAddress(adr))
+	{
+		clientIP = 0;
+	}
+
+	NPAsync<NPValidateUserTicketResult>* async = NP_ValidateUserTicket(ticketData, ticketLength, clientIP, npID, "NULL");
+	async->SetCallback(HandleSteamAuthResult, state);
+}
+
+StompHook getChallengeHook;
+DWORD getChallengeHookLoc = 0x4B95B1;
+
+void __declspec(naked) GetChallengeHookStub()
+{
+	__asm
+	{
+		push esi
+			push edx
+
+			call SV_SendAuthorize
+
+			add esp, 8h
+
+			pop edi
+			pop esi
+			pop ebp
+			pop ebx
+			add esp, 0Ch
+			retn
+	}
+}
+
+static int authed[MAX_CLIENTS];
+union addr
+{
+	DWORD m_b;
+	struct b_addr
+	{
+		BYTE b1;
+		BYTE b2;
+		BYTE b3;
+		BYTE b4;
+	} s_b;
+};
+
+void authResult(NPAsync<NPValidateUserTicketResult>* async) {
+
+	NPValidateUserTicketResult* result = async->GetResult();
+	ClientAuth* authingClient = (ClientAuth*)async->GetUserData();
+	if (result->result == ValidateUserTicketResultInvalid) {
+
+		NET_OutOfBandPrint(NS_SERVER, authingClient->adr, "error\n%s", "Ticket verification failed. Redownload the client from http://repziw4.de/ and try again.");
+		char buff[2048];
+		sprintf(buff, "clientkick %i %s", authingClient->clientNum, "Ticket verification failed. Redownload the client from http://repziw4.de/ and try again.");
+		Cmd_ExecuteSingleCommand(0, 0, buff);
+		return;
+
+	}
+
+	//Check if this dude is staff and may use the 11th prestige
+	//10 is techsupport
+	//Com_Printf(0, "GroupID: %i \n", result->groupID);
+	//Com_Printf(0, "Prestige: %i \n", authingClient->prestige);
+	if (authingClient->prestige == 11 && (
+		result->groupID != 8 &&
+		result->groupID != 5 &&
+		result->groupID != 9 &&
+		result->groupID != 4 &&
+		result->groupID != 16 &&
+		result->groupID != 10 &&
+		result->groupID != 14
+		)) {
+
+		NET_OutOfBandPrint(NS_SERVER, authingClient->adr, "error\n%s", "You are not staff, remove 11th prestige before joining.");
+		char buff[2048];
+		sprintf(buff, "clientkick %i %s", authingClient->clientNum, "You are not staff, remove 11th prestige before joining.");
+		Cmd_ExecuteSingleCommand(0, 0, buff);
+
+	}
+
+	if (authingClient->prestige > 11) {
+		NET_OutOfBandPrint(NS_SERVER, authingClient->adr, "error\n%s", "Invalid prestige.");
+		char buff[2048];
+		sprintf(buff, "clientkick %i %s", authingClient->clientNum, "Invalid prestige.");
+		Cmd_ExecuteSingleCommand(0, 0, buff);
+	}
+
+}
+
+void hookStatsReceived() {
+	/*
+	freopen("CONIN$", "r", stdin);
+	freopen("CONOUT$", "w", stdout);
+	freopen("CONIN$", "w", stderr);
+	*/
+
+	int clientCount = 0;
+
+
+	BYTE* clientAddress = (BYTE*)svs_clients;
+
+	for (int i = 0; i < *svs_numclients; i++) {
+		if (*clientAddress >= 3) {
+			clientCount++;
+		}
+
+		if (svs_clients[i].state == 3) {
+			int clientNum = CLIENTNUM(clientAddress);
+
+			DWORD clientIP = (svs_clients[i].adr.ip[0] << 24) | (svs_clients[i].adr.ip[1] << 16) | (svs_clients[i].adr.ip[2] << 8) | svs_clients[i].adr.ip[3];
+
+			if (NET_IsLanAddress(svs_clients[i].adr))
+			{
+				clientIP = 0;
+			}
+
+			if (authed[clientNum] == 0) {
+				authed[clientNum] = 1;
+
+				ClientAuth* authingClient = new ClientAuth();
+				authingClient->clientNum = clientNum;
+				authingClient->name = svs_clients[i].name;
+				authingClient->prestige = atoi(Info_ValueForKey(svs_clients[i].connectInfoString, "prestige"));
+				authingClient->adr = svs_clients[i].adr;
+
+
+				NPAsync<NPValidateUserTicketResult>* async = NP_ValidateUserTicket("nothing here whatsoever", 2048, clientIP, svs_clients[i].steamid, svs_clients[i].name);
+				async->SetCallback(authResult, authingClient);
+			}
+		}
+		clientAddress += 681872;
+	}
+
+	//printf("atleast we successfully hooked that darn function");
+	//Com_Printf(0, "lets do a long string here so we will see it on the first first first view............................");
+}
+
+void Auth_OnDisconnect(int clientNum)
+{
+	authed[clientNum] = 0;
+	//Com_Printf(0, "Auth_OnDisconnect: %i", clientNum);
+}
+
+void PatchMW2_PreAuthenticate()
+{
+	//On stats receive go through all the connected clients and do a second auth check. This time with we have the name and everything
+	DWORD call_bytes;
+	call_bytes = (DWORD)(&hookStatsReceived) - (0x4320B8 + 5);
+
+	*(BYTE*)0x4320A0 = 0xEB; //jmp
+	*(BYTE*)0x4320A1 = 0x15; //short iw4m...
+	*(BYTE*)0x4320B7 = 0x5B; //POP EBX, MIGHT be a fix... :O pls
+	*(BYTE*)0x4320B8 = 0xE8; //CALL
+	*(DWORD*)0x4320B9 = call_bytes; ///part of add lets see if the bytes are correct now
+	*(BYTE*)0x4320BD = 0xC3; //RETN
+
+	processSteamAuthHook.initialize(processSteamAuthHookLoc, ProcessSteamAuthHookFunc);
+	processSteamAuthHook.installHook();
+
+	getChallengeHook.initialize(getChallengeHookLoc, GetChallengeHookStub);
+	getChallengeHook.installHook();
+
+	// disable Steam auth
+	*(BYTE*)0x4663A8 = 0xEB;
+}

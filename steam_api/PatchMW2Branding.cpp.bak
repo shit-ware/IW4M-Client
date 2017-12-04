@@ -1,0 +1,135 @@
+// ==========================================================
+// IW4M project
+// 
+// Component: clientdll
+// Sub-component: steam_api
+// Purpose: branding for IW4M
+//
+// Initial author: NTAuthority
+// Started: 2011-06-09
+// ==========================================================
+
+#include "StdInc.h"
+
+#define IW4M_OLD_CODE
+
+typedef void* (__cdecl * R_RegisterFont_t)(const char* asset);
+R_RegisterFont_t R_RegisterFont = (R_RegisterFont_t)0x505670;
+
+typedef void (__cdecl * R_AddCmdDrawText_t)(const char* text, int, void* font, float screenX, float screenY, float, float, float rotation, float* color, int);
+R_AddCmdDrawText_t R_AddCmdDrawText = (R_AddCmdDrawText_t)0x509D80;
+
+typedef void (__cdecl * CL_DrawTextPhysical_t)(const char* text, int, void* font, float screenX, float screenY, float, float, float* color, int);
+CL_DrawTextPhysical_t CL_DrawTextPhysical = (CL_DrawTextPhysical_t)0x4376A0;
+
+dvar_t* cg_hideVersion;
+
+Font* LoadGameFont(const char* name, int stuff);
+
+CallHook drawDevStuffHook;
+DWORD drawDevStuffHookLoc = 0x5ACB99;
+
+int randBetween(int min, int max)
+{
+	return (rand() % (max - min)) + min;
+}
+
+void DrawDemoWarning()
+{
+	static int lastPosChange;
+	static int x, y;
+	
+	if (!g_nuiDraw)
+	{
+		return;
+	}
+
+	if (Com_Milliseconds() > (lastPosChange + 1000))
+	{
+		lastPosChange = Com_Milliseconds();
+
+		x = randBetween(10, g_nuiDraw->nuiWidth - 400);
+		y = randBetween(50, g_nuiDraw->nuiHeight - 50);
+	}
+		
+	if (!cg_hideVersion->current.boolean)
+	{
+		void* font = R_RegisterFont("fonts/objectivefont");
+		float color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		R_AddCmdDrawText("RepZ BETA", 0x7FFFFFFF, font, 10, 30, 0.7f, 0.7f, 0.0f, color, 0);
+	}
+}
+
+#pragma optimize("", off)
+void __declspec(naked) DrawDevStuffHookStub()
+{
+	__asm
+	{
+		call DrawDemoWarning
+		jmp drawDevStuffHook.pOriginal
+	}
+}
+#pragma optimize("", on)
+
+void CL_XStartPrivateMatch_f()
+{
+	Com_Error(2, "This feature is not available.");
+}
+
+HWND WINAPI CreateWindowExAWrap_WC(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+{
+	if (strcmp(lpClassName, "IW4 WinConsole"))
+	{
+		return CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+	}
+
+	return CreateWindowExW(dwExStyle, L"IW4 WinConsole", L"aIW\xB3 Console", dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+}
+
+HWND WINAPI CreateWindowExAWrap_G(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle, int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu, HINSTANCE hInstance, LPVOID lpParam)
+{
+	return CreateWindowExW(dwExStyle, L"IW4", L"RepZ\xB3", dwStyle, X, Y, nWidth, nHeight, hWndParent, hMenu, hInstance, lpParam);
+}
+
+void PatchMW2_Branding()
+{
+	cg_hideVersion = Dvar_RegisterBool("cg_hideversion", false, 1, "Hide the version release branding text.");
+
+	drawDevStuffHook.initialize(drawDevStuffHookLoc, DrawDevStuffHookStub);
+	drawDevStuffHook.installHook();
+
+	#ifdef IW4M_OLD_CODE
+	// displayed build tag in UI code
+	*(DWORD*)0x43F73B = (DWORD)VERSIONSTRING;
+
+	// console '%s: %s> ' string
+	*(DWORD*)0x5A44B4 = (DWORD)(VERSIONSTRING "> ");
+
+	// console version string
+	*(DWORD*)0x4B12BB = (DWORD)(VERSIONSTRING " " BUILDHOST " (built " __DATE__ " " __TIME__ ")");
+
+	// version string
+	*(DWORD*)0x60BD56 = (DWORD)(VERSIONSTRING " (built " __DATE__ " " __TIME__ ")");
+
+	// set fs_basegame to 'm2demo' (will apply before fs_game, unlike the above line)
+	*(DWORD*)0x6431D1 = (DWORD)"m2demo";
+
+	// increase font sizes for chat on higher resolutions
+	static float float13 = 13.0f;
+	static float float10 = 10.0f;
+	*(float**)0x5814AE = &float13;
+	*(float**)0x5814C8 = &float10;
+	#endif
+
+#ifdef PRE_RELEASE_DEMO
+	// disable private parties if demo
+	//*(DWORD*)0x40554E = (DWORD)CL_XStartPrivateMatch_f;
+	//*(DWORD*)0x5A992E = (DWORD)CL_XStartPrivateMatch_f;
+	//*(DWORD*)0x4058B9 = (DWORD)CL_XStartPrivateMatch_f; // xpartygo
+	//*(DWORD*)0x4152AA = (DWORD)CL_XStartPrivateMatch_f; // map
+
+	// use M2 playlists
+	strcpy((char*)0x6EE7AC, "mp_playlists_m2");
+	*(DWORD*)0x4D47FB = (DWORD)"mp_playlists_m2.ff";
+#endif
+}
